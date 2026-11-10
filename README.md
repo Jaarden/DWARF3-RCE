@@ -277,7 +277,8 @@ POST /uploadFirmwareDiff            (TCP 8082, no auth)
 `dwarf3_targetpath_poc.py` is the single shot PoC for the file write and the
 command injection. `dwarf3_shell.py` is an interactive root shell: it probes
 for a working injection path, then sends each command you type as an OTA upload
-and reads the output back off the webserver.
+and reads the output back off the webserver. Please do not cat larger files, this could crash the telescope :) 
+CP'ing to /DWARF3 and downloading it will do.
 
 ```bash
 # file write, harmless marker
