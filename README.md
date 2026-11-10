@@ -1,135 +1,115 @@
-# DWARF 3 — Unauthenticated Remote Root Compromise via the OTA Update Endpoint
+# DWARF 3: unauthenticated root compromise through the OTA update endpoint
 
-Security research against the **DWARF 3** smart telescope (DwarfLab). The
-device exposes an unauthenticated firmware-update endpoint that can be driven
-to arbitrary file write and OS command execution **as root**, with no
-signature verification anywhere in the update path.
+The DWARF 3 smart telescope runs an HTTP API on TCP 8082 with no
+authentication. One of its endpoints, `/uploadFirmwareDiff`, accepts a firmware
+package from anyone who can reach the device and does not verify that the
+package came from the vendor. I found two ways to abuse it: you can write a
+file anywhere on the filesystem as root, and you can get command execution as
+root. Both are confirmed on hardware.
 
-> Verified on a physical device the author owns. All analysis is against
-> firmware the vendor publishes. No third-party systems were touched.
+All testing was done on a DWARF 3 I own, on an isolated network.
 
----
-
-## Summary
-
-`POST /uploadFirmwareDiff` on TCP **8082** accepts a firmware package from any
-host that can reach the device, with **no authentication and no cryptographic
-verification**. Attacker-controlled fields from the request are used to build
-shell commands and filesystem destinations, yielding:
-
-* **remote code execution as `uid=0(root)`** (confirmed), and
-* **arbitrary file write as root, with the executable bit set on request**.
-
-Five distinct issues are documented below. Issues 1–3 are individually
-sufficient for full device compromise.
-
-| # | Issue | CWE | Severity |
-|---|-------|-----|----------|
-| 1 | OS command injection via OTA version fields → RCE as root | CWE-78 | Critical |
-| 2 | Arbitrary file write as root via `target_path` (+ `chmod +x`) | CWE-73 / CWE-22 | Critical |
-| 3 | No authentication and no signature verification on firmware update | CWE-306 / CWE-347 | Critical |
-| 4 | Failed upgrade reports success (unchecked `bspatch` result) | CWE-393 / CWE-252 | Medium |
-| 5 | Unauthenticated persistent firmware-version inflation (update DoS) | CWE-306 | Medium |
-
----
-
-## Affected
+## What is affected
 
 | | |
 |---|---|
-| **Vendor** | DwarfLab |
-| **Product** | DWARF 3 smart telescope |
-| **Component** | `magni` (main application daemon, ARM aarch64), HTTP API on TCP 8082 |
-| **Confirmed affected** | firmware **1.5.4.3** (device under test); static analysis against the published **1.5.4.1** package |
-| **Expected affected** | the whole 1.5.4.x line, and likely earlier — the endpoint predates these versions |
-| **Fixed in** | no fixed version known at time of writing |
-| **Attack vector** | network access to the device (its own Wi-Fi AP, or the LAN it joined) |
-| **Privileges required** | none |
-| **User interaction** | none |
+| Vendor | DwarfLab |
+| Product | DWARF 3 smart telescope |
+| Component | `magni`, the main application daemon (ARM aarch64). HTTP API on TCP 8082 |
+| Confirmed | firmware 1.5.4.3 on the device under test |
+| Analysed | the published 1.5.4.1 firmware package |
+| Probably affected | all of 1.5.4.x, and most likely earlier builds too, since the endpoint is older than these versions |
+| Fixed in | nothing yet, as far as I know |
+| Access needed | network access to the device. It runs its own Wi-Fi AP by default and is usually also joined to a home network |
+| Credentials needed | none |
+| User interaction | none |
 
-### Prior work / relationship to the earlier finding
+## Issues
 
-An earlier path-traversal issue in this same endpoint — `fileName` containing
-`../` to overwrite `/etc/vsftpd.conf` — was reported separately against
-firmware 1.4.7.5
-([DWARF-3-Root-Exploit](https://github.com/Jaarden/DWARF-3-Root-Exploit)).
+| # | Issue | CWE |
+|---|---|---|
+| 1 | Command injection through the OTA version fields, giving root RCE | CWE-78 |
+| 2 | Arbitrary file write as root through `target_path`, with optional chmod +x | CWE-73, CWE-22 |
+| 3 | No authentication and no signature check on firmware updates | CWE-306, CWE-347 |
+| 4 | A failed update reports success | CWE-393, CWE-252 |
+| 5 | Anyone can inflate the stored firmware version and block future updates | CWE-306 |
 
-**That issue is fixed in 1.5.4.x.** The multipart `filename=` is now rejected
-if it contains `/`, `\` or `..` (`magni` `0x841238`–`0x841360`), and the JSON
-`fileName` is passed through a whitelist sanitiser that keeps only
-`[A-Za-z0-9._-]` and replaces every other byte with `_` (`0x7f4b00`).
+Issues 1, 2 and 3 are each enough on their own to take over the device.
 
-The issues in this document are **different bugs in the same endpoint** and are
-not blocked by that fix. They warrant separate CVE IDs.
+## Relationship to my earlier finding
 
----
+I previously reported a path traversal in this same endpoint against firmware
+1.4.7.5, where `fileName` could contain `../` and overwrite `/etc/vsftpd.conf`:
+https://github.com/Jaarden/DWARF-3-Root-Exploit
 
-## Technical background
+That one is fixed in 1.5.4.x. The multipart `filename=` is now rejected if it
+contains `/`, `\` or `..` (see `magni` at `0x841238` to `0x841360`), and the
+JSON `fileName` goes through a whitelist that keeps only `[A-Za-z0-9._-]` and
+turns everything else into `_` (`0x7f4b00`).
 
-The endpoint takes `multipart/form-data` with two parts:
+The issues below are different bugs in the same endpoint. The 1.5.4.x fix does
+not stop any of them.
 
-* a field named **`firmwareInfo`** holding `{"data": { ... }}` — the update
-  metadata, and
-* a file part holding the firmware package (ZIP).
+## How the endpoint works
 
-The metadata fields are read at `0x8223e8`ff:
+The request is `multipart/form-data` with two parts:
+
+* a field named `firmwareInfo` holding `{"data": { ... }}`, the update metadata
+* a file part holding the firmware package (a ZIP)
+
+The metadata is parsed at `0x8223e8` onwards and consists of:
 
 ```
 deviceId  fileMd5  fullFileMd5  fileName  updateFileType  updateType
 newVersion  oldVersion
 ```
 
-`updateFileType` selects the install mode:
+`updateFileType` picks the install mode. A value of `1` means diff mode, where
+the upload is handed to `bspatch` as a patch file. Values of `0`, `2` or `3`
+mean full upgrade, where the upload is treated as the package and installed.
 
-* `1` → **diff mode**: the upload is fed to `bspatch` as a patch file.
-* `0`, `2`, `3` → **full upgrade**: the upload is treated as the package and
-  installed.
-
-Install is performed by `upgradeSoftwareLegacy`, reached from the request
-handler at `0x7f63c8` via the thunk at `0x9b2dc0`. It builds shell commands by
-string concatenation and executes them through
-`posix_spawn("/bin/sh", ["-c", cmd])` at `0x9d2340`
-(`"/bin/sh"` @ `0xd9aa40`, `"-c"` @ `0xd9aa48`):
+The install itself happens in `upgradeSoftwareLegacy`, reached from the request
+handler at `0x7f63c8` through the thunk at `0x9b2dc0`. It builds shell commands
+with string concatenation and runs them through
+`posix_spawn("/bin/sh", ["-c", cmd])` at `0x9d2340` (`"/bin/sh"` at `0xd9aa40`,
+`"-c"` at `0xd9aa48`):
 
 ```c
-cmd = "cp " + src + " " + dst;            // 0x9b140c, separator " " @ 0xda3680
+cmd = "cp " + src + " " + dst;            // 0x9b140c, the " " is at 0xda3680
 cmd = "bspatch " + old + " " + new + ...  // 0x9b2464
 ```
 
-Note the HTTP route strings are single-byte XOR-obfuscated in `.rodata`
-(`/uploadFirmwareDiff` at `0xd5e4b8`, key `0xc5`, registered at `0x7f1cb8`), so
-they do not appear in a plain `strings` dump. This is obfuscation, not a
-security control.
+One practical note for anyone reproducing this: the route strings are
+XOR-obfuscated with a single byte in `.rodata`, so `/uploadFirmwareDiff` does
+not show up in a plain `strings` dump. It sits at `0xd5e4b8` with key `0xc5`
+and is registered at `0x7f1cb8`. That is obfuscation, not a security control.
 
----
+## Issue 1: command injection through the version fields
 
-## Issue 1 — OS command injection via OTA version fields (RCE as root)
+CWE-78. CVSS v3.1 9.8 `AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H`. Score it 8.8 with
+`AV:A` instead if you treat Wi-Fi reachability as adjacent.
 
-**CWE-78** · Improper Neutralization of Special Elements used in an OS Command
-**CVSS v3.1 9.8 Critical** — `AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H`
-(use `AV:A` → 8.8 if your CNA scores Wi-Fi-local reachability as Adjacent)
+`newVersion` and `oldVersion` are taken straight from the request JSON and
+concatenated into the command strings above without quoting. They do not go
+through the sanitiser that `fileName` gets.
 
-`newVersion` and `oldVersion` are taken verbatim from the request JSON and
-concatenated **unquoted** into the command strings above. Unlike `fileName`,
-they are not sanitised.
-
-The version gate at `0x9b0e04` parses only the numeric prefix (a
-`stringstream` parse at `0x9b5040`), so a value such as
+The version check at `0x9b0e04` only reads the numeric prefix, because the
+parse at `0x9b5040` uses a stringstream and stops at the first non-digit. So a
+value like:
 
 ```
 1.5.4.19; id > /DWARF3/himom; #
 ```
 
-passes validation as `1.5.4.19` while the remainder survives into the shell
-command:
+passes the version check as `1.5.4.19`, and the rest ends up in the command:
 
 ```sh
 cp <src> /usrdata/firmware/dwarf3_upgrade_firmware_v1.5.4.19; id > /DWARF3/himom; #.zip
 ```
 
-`cp` runs, then the injected command runs, then `#` comments out the tail.
+`cp` runs, then the injected command runs, then `#` comments out the rest.
 
-### Confirmation
+Reproduction:
 
 ```console
 $ python3 dwarf3_targetpath_poc.py <ip> --target /DWARF3 \
@@ -141,23 +121,26 @@ $ curl -s http://<ip>/DWARF3/himom
 uid=0(root) gid=0(root)
 ```
 
-The non-zero OTA response code is a *downstream* symptom: the injected command
-has already executed by the time the install fails. Output is read back over
-the device's own webserver, which serves `/DWARF3` with `autoindex on`
-(`location /DWARF3 { root /; autoindex on; }` in `nginx.conf`).
+The non-zero response code is misleading. The injected command has already run
+by the time the install fails, so you get the error code and the execution.
 
-`dwarf3_shell.py` turns this into an interactive root shell.
+Output comes back over the device's own webserver, which serves `/DWARF3` with
+directory listing turned on. From `nginx.conf`:
 
----
+```
+location /DWARF3 { root /; autoindex on; }
+```
 
-## Issue 2 — Arbitrary file write as root via `target_path`
+`dwarf3_shell.py` wraps this into an interactive root shell.
 
-**CWE-73** External Control of File Name or Path (also **CWE-22**)
-**CVSS v3.1 9.8 Critical** — `AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H`
+## Issue 2: arbitrary file write as root
 
-In full-upgrade mode the package is extracted and each module directory
-(`iq`, `bin`, `libs`, `config`, `mcu`, `model`) is scanned for an
-`update.json` manifest, parsed at `0x9abf70`:
+CWE-73 (external control of file name or path), also CWE-22.
+CVSS v3.1 9.8 `AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H`.
+
+In full upgrade mode the package is extracted and each module directory (`iq`,
+`bin`, `libs`, `config`, `mcu`, `model`) is checked for an `update.json`
+manifest. That manifest is parsed at `0x9abf70` and looks like this:
 
 ```json
 { "fileInfo": [ { "name": "payload",
@@ -166,13 +149,14 @@ In full-upgrade mode the package is extracted and each module directory
                   "need_execute": 1 } ] }
 ```
 
-`target_path` is **fully attacker-controlled and unvalidated** — no allowlist,
-no canonicalisation, no `realpath()`. The `".."` literal at `0xd65990` is
-referenced only by the multipart filename checks, never by the installer
-(`0x9a8000`–`0x9b3000`). `need_execute: 1` makes the installer `chmod +x` the
-written file.
+`target_path` is attacker controlled and never validated. There is no
+allowlist, no canonicalisation and no `realpath()` call anywhere in the
+installer. The `".."` string at `0xd65990` is only referenced by the multipart
+filename checks, never by the install code between `0x9a8000` and `0x9b3000`.
+Setting `need_execute` to 1 makes the installer chmod +x the file it just
+wrote.
 
-### Confirmation
+Reproduction:
 
 ```console
 $ python3 dwarf3_targetpath_poc.py <ip> --target /DWARF3 --update-file-type 0
@@ -183,56 +167,57 @@ $ curl -s http://<ip>/DWARF3/ | grep poc_marker
 <a href="poc_marker">poc_marker</a>    01-Jan-2038 00:21    23
 ```
 
-### Escalation to persistent root execution
+### Turning that into persistence
 
-The vendor's own manifest ships these entries, so both are documented install
-targets:
+The vendor's own manifests already ship these two entries, so both are
+documented install targets rather than anything exotic:
 
 ```json
 { "name": "run.sh",                 "target_path": "/usrdata", "need_execute": 1 }
 { "name": "usb_gadget_configfs.sh", "target_path": "/etc",     "need_execute": 1 }
 ```
 
-`/usrdata/run.sh` is the device boot script and invokes
-`/etc/usb_gadget_configfs.sh` as root at every boot. Writing either yields
-persistent root code execution that survives reboot.
+`/usrdata/run.sh` is the boot script, and it calls
+`/etc/usb_gadget_configfs.sh` as root on every boot. Overwriting either gives
+you root execution that survives a reboot. If you reproduce this, append to the
+original `usb_gadget_configfs.sh` rather than replacing `run.sh`. A broken
+`run.sh` leaves the device with no network and no services.
 
----
+## Issue 3: no authentication, no signature check
 
-## Issue 3 — No authentication, no signature verification
+CWE-306 and CWE-347. CVSS v3.1 9.8 `AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H`.
 
-**CWE-306** Missing Authentication for Critical Function
-**CWE-347** Improper Verification of Cryptographic Signature
-**CVSS v3.1 9.8 Critical** — `AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H`
+Three separate things are missing here.
 
-* The HTTP API on 8082 has **no authentication of any kind**. `magni` contains
-  no `Authorization`, `Bearer`, `WWW-Authenticate` or `Unauthorized` strings,
-  and no libhv request preprocessor is installed.
-* Firmware packages are **not signed**. No `EVP_DigestVerify`, `ECDSA_verify`,
-  `signature` or `pubkey` handling exists in the update path.
-* The only integrity check is an **MD5 supplied by the client in the same
-  request** (`fileMd5` / `fullFileMd5`), which provides no authenticity
-  guarantee whatsoever.
+The API on 8082 has no authentication at all. `magni` contains no
+`Authorization`, `Bearer`, `WWW-Authenticate` or `Unauthorized` strings, and no
+libhv request preprocessor is installed.
 
-Any host that can reach the device can therefore install arbitrary firmware.
+Firmware packages are not signed. There is no `EVP_DigestVerify`,
+`ECDSA_verify`, `signature` or `pubkey` handling anywhere in the update path.
 
----
+The only integrity check is an MD5 that the client supplies in the same request
+(`fileMd5` and `fullFileMd5`). That catches corruption in transit and nothing
+else. An attacker just computes the MD5 of their own package.
 
-## Issue 4 — Failed upgrade reports success
+The result is that anyone who can reach the device can install any firmware
+they like.
 
-**CWE-393** Return of Wrong Status Code · **CWE-252** Unchecked Return Value
-**CVSS v3.1 5.3 Medium** — `AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:L/A:L`
+## Issue 4: a failed update reports success
 
-In diff mode the patch command is built as:
+CWE-393 and CWE-252. CVSS v3.1 5.3 `AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:L/A:L`.
+
+In diff mode the patch command is built like this:
 
 ```
 bspatch <old>.zip  /tmp/<new>.zip  /tmp/<new>.zip
             old       newfile          patchfile
 ```
 
-`newfile` and `patchfile` are **the same path**, so `bspatch` truncates the
-patch file while still reading it. The exit status is never checked, nothing is
-logged, and the handler returns `code: 0` to the client while the device logs:
+`newfile` and `patchfile` are the same path, so bspatch truncates the patch
+file while it is still reading it. The exit status is never checked and nothing
+is logged about it. The handler then returns `code: 0` to the client while the
+device log says:
 
 ```
 [ERROR][upgradeSoftwareLegacy] Directory not found: iq
@@ -241,135 +226,119 @@ logged, and the handler returns `code: 0` to the client while the device logs:
 [INFO][completeFirmwareUploadResponse] OTA response: code=0 stage=upgrade
 ```
 
-A failed update is indistinguishable from a successful one to any client,
-and the firmware version is still committed.
+A client cannot tell a failed update from a successful one, and the version
+number gets committed either way.
 
----
+## Issue 5: anyone can inflate the firmware version
 
-## Issue 5 — Unauthenticated persistent version inflation
-
-**CWE-306** Missing Authentication for Critical Function
-**CVSS v3.1 6.5 Medium** — `AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H`
+CWE-306. CVSS v3.1 6.5 `AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H`.
 
 Every accepted upload writes `newVersion` into
-`/userdata/config/factory/firmware_version.json` — including uploads whose
-install fails. The value is never validated against anything authoritative.
+`/userdata/config/factory/firmware_version.json`, including uploads where the
+install then fails. Nothing validates that value against anything.
 
-The version gate at `0x9b0e04` rejects any package that is not strictly newer
-than the stored version. An attacker can therefore set the stored version
-arbitrarily high (e.g. `9.9.9.9`) and **permanently prevent the device from
-accepting legitimate vendor updates**, without authentication and with no
-user-visible indication beyond the reported version string.
+Because the check at `0x9b0e04` rejects any package that is not strictly newer
+than the stored version, you can set the stored version to something like
+9.9.9.9 and the device will refuse every real vendor update from then on. No
+credentials needed, and the only sign anything is wrong is the version string
+the device reports.
 
-During testing the device under test was driven from 1.5.4.3 to 1.5.4.18 by
-repeated uploads.
+My test device went from 1.5.4.3 to 1.5.4.18 over the course of this research,
+purely from repeated uploads.
 
----
-
-## Exploit chain
+## The chain
 
 ```
-POST /uploadFirmwareDiff            (TCP 8082, unauthenticated)
+POST /uploadFirmwareDiff            (TCP 8082, no auth)
   multipart/form-data
     part "firmwareInfo"  = {"data": {deviceId, fileMd5, fullFileMd5,
                                      fileName, updateFileType, updateType,
                                      newVersion, oldVersion}}
     part file            = ZIP package
-         │
-         ├─ oldVersion == device version, newVersion strictly greater   (0x9b0e04)
-         ├─ updateFileType ∈ {0,2,3}  → full-upgrade branch
-         ├─ ZIP needs explicit directory entries for the six modules
-         │      (libzip only mkdir()s for explicit entries)
-         │
-         ├─[1]─ version fields → unquoted shell command → /bin/sh -c    → RCE root
-         └─[2]─ <module>/update.json target_path → arbitrary write      → root write
-                need_execute: 1 → chmod +x → boot persistence
+
+  requirements:
+    oldVersion must equal the device's current version
+    newVersion must be strictly greater          (0x9b0e04)
+    updateFileType must be 0, 2 or 3 for full upgrade
+    the ZIP needs explicit directory entries for the six module dirs,
+      because the libzip based extractor only mkdir()s for those
+
+  then:
+    [1] version fields land unquoted in a shell command  -> root RCE
+    [2] target_path in <module>/update.json              -> arbitrary root write
+        need_execute: 1                                  -> chmod +x, boot persistence
 ```
 
----
+## Scripts
 
-## Tooling
-
-| File | Purpose |
-|---|---|
-| `dwarf3_targetpath_poc.py` | single-shot PoC: arbitrary file write and/or command injection |
-| `dwarf3_shell.py` | interactive root shell (probes for a working injection path, output via the device webserver) |
+`dwarf3_targetpath_poc.py` is the single shot PoC for the file write and the
+command injection. `dwarf3_shell.py` is an interactive root shell: it probes
+for a working injection path, then sends each command you type as an OTA upload
+and reads the output back off the webserver.
 
 ```bash
-# arbitrary write, harmless marker
+# file write, harmless marker
 python3 dwarf3_targetpath_poc.py <ip> --target /DWARF3
 
 # command injection
 python3 dwarf3_targetpath_poc.py <ip> --inject-field new --inject 'id > /DWARF3/himom'
 curl -s http://<ip>/DWARF3/himom
 
-# interactive root shell
+# interactive shell
 python3 dwarf3_shell.py <ip>
 ```
 
-Both are stdlib-only Python 3.
+Both are Python 3 with no dependencies outside the standard library.
 
----
+The shell is not a tty. Each command is one OTA upload plus one HTTP GET, so
+expect two to four seconds per command and do not expect `vi` or `top` to work.
 
 ## Impact
 
-An attacker on the same network as the device can, without credentials:
+Someone on the same network as the device can, with no credentials:
 
-* execute arbitrary commands as **root**;
-* read and exfiltrate all stored media and configuration;
-* install a persistent backdoor that survives reboot;
-* replace the firmware with an arbitrary image (no signature check);
-* permanently block legitimate firmware updates.
+* run arbitrary commands as root
+* read and copy off all stored photos, video and configuration
+* install a backdoor that survives reboot
+* replace the firmware entirely, since nothing checks signatures
+* permanently stop the device from accepting real updates
 
-The DWARF 3 operates its own Wi-Fi access point by default and is also commonly
-joined to a home network, so reachability is the normal operating condition
-rather than an unusual one.
+The DWARF 3 runs its own Wi-Fi access point by default and is commonly joined
+to a home network as well, so being reachable is the normal state, not an edge
+case.
 
----
+## What should be fixed
 
-## Recommended remediation
+1. Put authentication on the update endpoint. The whole 8082 API is open right
+   now, but the OTA endpoint is the urgent one.
+2. Sign firmware packages and check the signature against a vendor public key
+   before writing any file or running any command. A client supplied MD5 is not
+   an integrity control.
+3. Stop building shell commands by concatenating strings. Use
+   `posix_spawn` or `execve` with an argument vector, or at the very least
+   shell quote every value that gets interpolated.
+4. Validate `target_path`: resolve it with `realpath()` and reject anything
+   that lands outside an explicit install root. Do the same for `name`.
+5. Validate the version fields against something like `^\d+(\.\d+){3}$` and
+   reject anything that does not match, instead of reading a numeric prefix and
+   ignoring the rest.
+6. Do not call bspatch with the same path for `newfile` and `patchfile`, check
+   its exit status, and return an error when it fails.
+7. Only write the new version number after the install has actually succeeded.
 
-1. **Authenticate the update endpoint.** The whole 8082 API is currently
-   unauthenticated; at minimum the OTA endpoint must require a device-bound
-   credential.
-2. **Sign firmware packages** and verify the signature with a vendor public key
-   before any file is written or any command is run. A client-supplied MD5 is
-   not an integrity control.
-3. **Never build shell commands by string concatenation.** Replace the `cp` /
-   `bspatch` `system`-style invocations with `posix_spawn`/`execve` passing an
-   argument vector, or at minimum shell-quote every interpolated value.
-4. **Validate `target_path`**: resolve with `realpath()` and reject anything
-   outside an explicit install-root allowlist. Apply the same treatment to
-   `name`.
-5. **Validate the version fields** against a strict `^\d+(\.\d+){3}$` regex and
-   reject anything else, rather than parsing a numeric prefix and ignoring the
-   rest.
-6. **Check return values.** `bspatch` must not be invoked with identical
-   `newfile` and `patchfile` paths, its exit status must be checked, and a
-   failed upgrade must return an error and must not commit a version bump.
-7. **Do not commit the firmware version** until the install has actually
-   succeeded and been verified.
-
----
-
-## Disclosure
+## Disclosure timeline
 
 | Date | Event |
 |---|---|
-| _TBD_ | Vendor notified |
-| _TBD_ | Vendor acknowledgement |
-| _TBD_ | Fix released |
-| _TBD_ | Public disclosure |
+| TBD | Vendor notified |
+| TBD | Vendor acknowledged |
+| TBD | Fix released |
+| TBD | Public disclosure |
 
-Reported by **Justin Aarden**.
+Found and reported by Justin Aarden.
 
-Earlier related finding (path traversal, fixed in 1.5.4.x):
-<https://github.com/Jaarden/DWARF-3-Root-Exploit>
+## Legal note
 
----
-
-## Legal and ethical note
-
-All testing was carried out against a DWARF 3 owned by the author, on an
-isolated network. No third-party devices were accessed. This material is
-published for defensive and remediation purposes.
+Everything here was tested against a DWARF 3 I own, on an isolated network. No
+other devices were touched. This is published so the vendor can fix it and so
+owners can understand the risk.
