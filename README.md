@@ -9,6 +9,9 @@ root. Both are confirmed on hardware.
 
 All testing was done on a DWARF 3 I own, on an isolated network.
 
+USE AT YOUR OWN RISK! 
+Sometimes it can be that the device becomes unresponsive and shows a red ring. Don't worry, reboot the device and you're good to go.
+
 ## What is affected
 
 | | |
